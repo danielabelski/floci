@@ -3968,6 +3968,25 @@ class CodeArtifactServiceTest {
     }
 
     @Test
+    void containerBackedOverriddenVersionStatusesReturnsOnlyVersionsAnOverrideWasEverRecordedFor() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        CodeArtifactRepository created = service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        String repoId = created.getSidecarContainerIds().get("pypi");
+        when(pypiserverClient.listPackageVersions(eq(repoId), eq("dom"), eq("repo"), isNull(), eq("my-pkg")))
+                .thenReturn(List.of(
+                        new RepositorySidecarManager.PackageVersionTimestamp("1.0.0", Instant.ofEpochSecond(1000))));
+
+        service.updatePackageVersionsStatus(REGION, "dom", null, "repo", "pypi", null, "my-pkg", List.of("1.0.0"),
+                null, null, "Archived");
+
+        assertEquals(Map.of("1.0.0", "Archived"),
+                service.containerBackedOverriddenVersionStatuses(REGION, "dom", null, "repo", "pypi", null,
+                        "my-pkg"));
+        assertEquals(Map.of(), service.containerBackedOverriddenVersionStatuses(REGION, "dom", null, "repo", "pypi",
+                null, "other-pkg"));
+    }
+
+    @Test
     void disposePackageVersionsDeletesEveryRealAssetAndKeepsListingTheVersionAsDisposed() {
         service.createDomain(REGION, "dom", null, Map.of());
         CodeArtifactRepository created = service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());

@@ -1966,6 +1966,30 @@ public class CodeArtifactService implements Resettable {
     }
 
     /**
+     * Every version of {@code packageName} that currently carries a status override, by its own
+     * status string, for a caller that needs to recognize an Archived/Disposed coordinate without
+     * already knowing which version it is. Raised by hectorvent's follow-up on this PR: a real
+     * twine upload's {@code version} form field is optional, and {@code
+     * CodeArtifactPypiController#upload} trusts the uploaded filename over that field the same way
+     * pypiserver itself does (see {@code PypiserverSidecarClient#filenameEmbedsVersion}'s own
+     * javadoc), so a missing field must not let an upload skip {@link
+     * #requireContainerBackedVersionNotArchivedOrDisposed} outright. Kept here rather than as a
+     * pypi-specific method: this class stays agnostic of any one format's own filename shape, so
+     * the caller matches {@code filename} against whichever of these versions it actually names.
+     * Empty for the overwhelming common case, a package no one has ever called {@code
+     * UpdatePackageVersionsStatus}/{@code DisposePackageVersions} against.
+     */
+    public synchronized Map<String, String> containerBackedOverriddenVersionStatuses(String region, String domain,
+            String domainOwner, String repository, String format, String namespace, String packageName) {
+        String owner = effectiveOwner(domainOwner);
+        Map<String, PackageVersionStatusOverride> overrides = containerBackedOverridesForPackage(owner, region,
+                domain, repository, format, namespace, packageName);
+        Map<String, String> result = new LinkedHashMap<>();
+        overrides.forEach((version, override) -> result.put(version, override.status()));
+        return result;
+    }
+
+    /**
      * Unlike {@code GetPackageVersionAsset}, real CodeArtifact's {@code DescribePackageVersion}
      * response has no asset listing at all (confirmed against the wire model: {@code
      * PackageVersionDescription} has no such member; enumerating a version's files is {@link

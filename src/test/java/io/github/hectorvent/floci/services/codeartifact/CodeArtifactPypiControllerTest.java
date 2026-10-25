@@ -15,6 +15,7 @@ import java.net.InetSocketAddress;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -433,6 +434,35 @@ class CodeArtifactPypiControllerTest {
         assertEquals(false, uploadReceived.get());
         verify(service, never()).recordContainerBackedAssetBytes(any(), any(), any(), any(), any(), any(), any(),
                 anyLong(), anyLong());
+    }
+
+    /**
+     * hectorvent's follow-up on this PR: a missing version field must not let an upload of an
+     * Archived/Disposed version through just because there is no explicit coordinate to check.
+     * The uploaded filename itself names version 1.0.0, which this package's only override marks
+     * Disposed, so the guard must still fire even though the form carries no version field at all.
+     */
+    @Test
+    void uploadWithNoVersionFieldStillRejectsAFilenameNamingAnArchivedOrDisposedVersion() {
+        AtomicBoolean uploadReceived = new AtomicBoolean();
+        backend.createContext("/simple/my-pkg/", exchange -> respond(exchange, 404, "text/plain", ""));
+        backend.createContext("/", exchange -> {
+            uploadReceived.set(true);
+            respond(exchange, 200, "text/plain", "");
+        });
+        when(service.containerBackedOverriddenVersionStatuses(any(), eq(DOMAIN), any(), eq(REPOSITORY), eq("pypi"),
+                isNull(), eq("my-pkg"))).thenReturn(Map.of("1.0.0", "Disposed"));
+        doThrow(new AwsException("ConflictException", "Package version '1.0.0' of package 'my-pkg' is Disposed "
+                + "and cannot be republished.", 409))
+                .when(service).requireContainerBackedVersionNotArchivedOrDisposed(any(), eq(DOMAIN), any(),
+                        eq(REPOSITORY), eq("pypi"), isNull(), eq("my-pkg"), eq("1.0.0"));
+        byte[] body = multipartWithFile("boundary123", "my-pkg", "my_pkg-1.0.0.tar.gz", "new content");
+
+        Response response = controller.upload(
+                headers("Bearer good", "multipart/form-data; boundary=boundary123"), DOMAIN, REPOSITORY, body);
+
+        assertEquals(409, response.getStatus());
+        assertEquals(false, uploadReceived.get());
     }
 
     /** A missing version field, same as the readme capture right below it, has no coordinate to clear. */

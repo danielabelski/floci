@@ -27,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
@@ -196,10 +197,23 @@ public class CodeArtifactPypiController {
             // missing/blank version is the same case the override-clearing call below already
             // skips: no coordinate to block either way.
             String beforeRevision = null;
-            if (version != null && !version.isBlank()) {
+            // Raised by hectorvent's follow-up on this same PR: a missing/blank version field
+            // must not let this guard be skipped just because there is no explicit coordinate to
+            // check directly. pypiserver trusts the filename over the form fields regardless (see
+            // PypiserverSidecarClient#filenameEmbedsVersion's own javadoc), so an Archived/Disposed
+            // version this upload's own filename names is found by checking it against every
+            // version of this package that currently carries a status override, the same guard
+            // below runs against once one is found. A real version field always wins when present:
+            // this fallback only matters for a client that omits it.
+            String guardVersion = version;
+            if (guardVersion == null || guardVersion.isBlank()) {
+                guardVersion = archivedOrDisposedVersionFromFilename(handle, domain, repository, packageName,
+                        file.get().filename());
+            }
+            if (guardVersion != null) {
                 try {
                     beforeRevision = service.requireContainerBackedVersionNotArchivedOrDisposed(handle.region(),
-                            domain, handle.owner(), repository, "pypi", null, packageName, version);
+                            domain, handle.owner(), repository, "pypi", null, packageName, guardVersion);
                 } catch (AwsException e) {
                     return Response.status(409).entity(e.getMessage()).build();
                 }
@@ -316,6 +330,29 @@ public class CodeArtifactPypiController {
 
     private static String normalizePackageName(String name) {
         return name.toLowerCase(Locale.ROOT).replaceAll("[-_.]+", "-");
+    }
+
+    /**
+     * The exact version a status override currently marks Archived or Disposed that {@code
+     * filename} actually names, found by checking it against every version of {@code packageName}
+     * that currently carries any override at all ({@link CodeArtifactService
+     * #containerBackedOverriddenVersionStatuses} is empty for the overwhelming common case, a
+     * package no one has ever called {@code UpdatePackageVersionsStatus}/{@code
+     * DisposePackageVersions} against, so this is cheap in practice). {@code null} when nothing
+     * matches, including when the package has no overrides to check at all.
+     */
+    private String archivedOrDisposedVersionFromFilename(RepositoryHandle handle, String domain, String repository,
+                                                           String packageName, String filename) {
+        Map<String, String> overriddenStatuses = service.containerBackedOverriddenVersionStatuses(handle.region(),
+                domain, handle.owner(), repository, "pypi", null, packageName);
+        for (Map.Entry<String, String> entry : overriddenStatuses.entrySet()) {
+            String status = entry.getValue();
+            if (("Archived".equals(status) || "Disposed".equals(status))
+                    && PypiserverSidecarClient.filenameEmbedsVersion(filename, packageName, entry.getKey())) {
+                return entry.getKey();
+            }
+        }
+        return null;
     }
 
     /**
