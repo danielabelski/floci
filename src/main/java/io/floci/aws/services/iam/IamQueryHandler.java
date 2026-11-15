@@ -3,6 +3,7 @@ package io.floci.aws.services.iam;
 import io.floci.aws.core.common.*;
 import io.floci.aws.core.common.AwsQueryLists;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.common.SmithyValidationErrors;
 import io.floci.aws.services.iam.model.AccessKey;
 import io.floci.aws.services.iam.model.AccountPasswordPolicy;
@@ -102,6 +103,8 @@ public class IamQueryHandler {
     private final DelegationRequestService delegationRequestService;
     private final CentralRootAccess centralRootAccess;
     private final RegionResolver regionResolver;
+    /** The caller this request signed as, which says whether a delegation bounds what it creates. */
+    private final RequestContext requestContext;
     private final Instance<ServerCertificateReferenceProvider> serverCertificateReferenceProviders;
     /** Signs each page's Marker, so only a marker this handler issued names an item. */
     private final SignedMarkers markers = new SignedMarkers(MARKER_MAX_LENGTH);
@@ -114,6 +117,7 @@ public class IamQueryHandler {
                            DelegationRequestService delegationRequestService,
                            CentralRootAccess centralRootAccess,
                            RegionResolver regionResolver,
+                           RequestContext requestContext,
                            Instance<ServerCertificateReferenceProvider> serverCertificateReferenceProviders) {
         this.iamService = iamService;
         this.policyEvaluator = policyEvaluator;
@@ -122,6 +126,7 @@ public class IamQueryHandler {
         this.serviceLastAccessedService = serviceLastAccessedService;
         this.organizationsAccessReportService = organizationsAccessReportService;
         this.delegationRequestService = delegationRequestService;
+        this.requestContext = requestContext;
         this.centralRootAccess = centralRootAccess;
         this.regionResolver = regionResolver;
         this.serverCertificateReferenceProviders = serverCertificateReferenceProviders;
@@ -1353,8 +1358,15 @@ public class IamQueryHandler {
         String description = getParam(params, "Description");
         int maxSession = getIntParam(params, "MaxSessionDuration", 3600);
         Map<String, String> tags = extractTags(params, true);
+        // A role created with delegated credentials carries the boundary the delegation request
+        // names, the guide's long-term permissions "limit[ing] the permissions of any roles that
+        // are created or managed through temporary access". It is a cap the customer registered
+        // rather than a choice of the caller, so it is the role's boundary wherever the request
+        // restricts one, and what the call asked for applies only when it does not.
+        String boundary = iamService.delegatedRoleBoundaryArn(requestContext.getAccessKeyId())
+                .orElseGet(() -> getParam(params, "PermissionsBoundary"));
         IamRole role = iamService.createRole(roleName, path, trustPolicy, description, maxSession, tags,
-                getParam(params, "PermissionsBoundary"));
+                boundary);
         String result = new XmlBuilder().start("Role").raw(roleXml(role, true)).end("Role").build();
         return Response.ok(AwsQueryResponse.envelope("CreateRole", AwsNamespaces.IAM, result)).build();
     }

@@ -420,6 +420,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     private final Object mfaDeviceLock = new Object();
     private final RegionResolver regionResolver;
+    /**
+     * The partner permissions boundaries configuration registered, by ARN. Empty unless a file was
+     * configured, which is the account that never onboarded with AWS for temporary delegation.
+     */
+    private final Map<String, String> partnerPermissionBoundaries;
     private final Clock clock;
     private final boolean seedDeployerPrincipal;
     private final String seededAccountAlias;
@@ -492,6 +497,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             regionResolver,
             config.services().iam().seedDeployerPrincipal(),
             config.services().iam().accountAlias().orElse(null),
+            PartnerPermissionBoundaries.load(config.services().iam().partnerPermissionBoundariesPath())
+                    .documentsByArn(),
             clock
         );
     }
@@ -620,7 +627,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 passwordPolicies, loginProfiles, oidcProviders, serviceLinkedRoleDeletions, orgRootFeatures,
                 credentialReports, virtualMfaDevices, serverCertificates, signingCertificates, sshPublicKeys,
                 serviceCredentials, accountProperties, stsPreferences, outboundFederation,
-                regionResolver, seedDeployerPrincipal, seededAccountAlias, Clock.systemUTC());
+                regionResolver, seedDeployerPrincipal, seededAccountAlias, Map.of(), Clock.systemUTC());
     }
 
     IamService(StorageBackend<String, IamUser> users,
@@ -649,6 +656,44 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                boolean seedDeployerPrincipal,
                String seededAccountAlias,
                Clock clock) {
+        this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions, accountAliases,
+                passwordPolicies, loginProfiles, oidcProviders, serviceLinkedRoleDeletions, orgRootFeatures,
+                credentialReports, virtualMfaDevices, serverCertificates, signingCertificates, sshPublicKeys,
+                serviceCredentials, accountProperties, stsPreferences, outboundFederation,
+                regionResolver, seedDeployerPrincipal, seededAccountAlias, Map.of(), clock);
+    }
+
+    /**
+     * The same with the permissions boundaries registered for a delegation partner, which no
+     * account holds and no caller can create. Every other constructor registers none.
+     */
+    IamService(StorageBackend<String, IamUser> users,
+               StorageBackend<String, IamGroup> groups,
+               StorageBackend<String, IamRole> roles,
+               StorageBackend<String, IamPolicy> policies,
+               StorageBackend<String, AccessKey> accessKeys,
+               StorageBackend<String, InstanceProfile> instanceProfiles,
+               StorageBackend<String, SessionCredential> sessions,
+               StorageBackend<String, String> accountAliases,
+               StorageBackend<String, AccountPasswordPolicy> passwordPolicies,
+               StorageBackend<String, LoginProfile> loginProfiles,
+               StorageBackend<String, OpenIDConnectProvider> oidcProviders,
+               StorageBackend<String, String> serviceLinkedRoleDeletions,
+               StorageBackend<String, OrganizationRootFeatures> orgRootFeatures,
+               StorageBackend<String, CredentialReport> credentialReports,
+               StorageBackend<String, VirtualMfaDevice> virtualMfaDevices,
+               StorageBackend<String, ServerCertificate> serverCertificates,
+               StorageBackend<String, SigningCertificate> signingCertificates,
+               StorageBackend<String, SshPublicKey> sshPublicKeys,
+               StorageBackend<String, ServiceSpecificCredential> serviceCredentials,
+               StorageBackend<String, String> accountProperties,
+               StorageBackend<String, String> stsPreferences,
+               StorageBackend<String, OutboundWebIdentityFederation> outboundFederation,
+               RegionResolver regionResolver,
+               boolean seedDeployerPrincipal,
+               String seededAccountAlias,
+               Map<String, String> partnerPermissionBoundaries,
+               Clock clock) {
         this.users = users;
         this.groups = groups;
         this.roles = roles;
@@ -674,6 +719,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         this.regionResolver = regionResolver;
         this.seedDeployerPrincipal = seedDeployerPrincipal;
         this.seededAccountAlias = seededAccountAlias;
+        this.partnerPermissionBoundaries = Map.copyOf(partnerPermissionBoundaries);
         this.clock = clock;
     }
 
@@ -1706,7 +1752,28 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             // Authorization and ListAttached* need policy documents or names, not attachment counts.
             return Optional.ofNullable(awsManagedPoliciesFor(arn).get(arn));
         }
-        return policies.get(arn);
+        Optional<IamPolicy> stored = policies.get(arn);
+        return stored.isPresent() ? stored : partnerPermissionBoundary(arn);
+    }
+
+    /**
+     * A permissions boundary registered for a delegation partner, which no account holds and no
+     * caller can create: AWS registers those out of band and publishes their ARNs with the word
+     * {@code partner} where an account id goes, so the document comes from configuration or the
+     * boundary resolves to nothing. It is served the way an AWS managed policy is, from a catalog
+     * beside the store rather than out of it, so nothing is listed or attachable that was not
+     * before and only the boundary that a delegation request names can reach it.
+     */
+    private Optional<IamPolicy> partnerPermissionBoundary(String arn) {
+        String document = arn == null ? null : partnerPermissionBoundaries.get(arn);
+        if (document == null) {
+            return Optional.empty();
+        }
+        String name = arn.substring(arn.lastIndexOf('/') + 1);
+        Instant registered = clock.instant();
+        return Optional.of(new IamPolicy("ANPA" + randomId(16), name,
+                "/permission_boundary/", arn, "Registered partner permissions boundary",
+                new PolicyVersion("v1", document, true, registered), registered, registered));
     }
 
     private int managedPolicyAttachmentCount(String policyArn) {
@@ -4908,10 +4975,45 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void registerDelegatedSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
                                          String delegatedApproverArn, Instant expiration,
                                          String sessionPolicyDocument, String ownerAccountId) {
+        registerDelegatedSession(sessionAccessKeyId, secretAccessKey, sessionToken, delegatedApproverArn,
+                expiration, sessionPolicyDocument, ownerAccountId, List.of());
+    }
+
+    /**
+     * The same with the boundaries the delegation request restricts a role to, which the guide
+     * calls the long-term half of the feature: they "limit the permissions of any roles that are
+     * created or managed through temporary access", so the session carries them and a role created
+     * with it takes one.
+     */
+    public void registerDelegatedSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                                         String delegatedApproverArn, Instant expiration,
+                                         String sessionPolicyDocument, String ownerAccountId,
+                                         List<String> roleBoundaryArns) {
         SessionCredential session = new SessionCredential(sessionAccessKeyId, secretAccessKey, sessionToken,
                 null, expiration, sessionPolicyDocument, ownerAccountId);
         session.setDelegatedApproverArn(delegatedApproverArn);
+        session.setDelegatedRoleBoundaryArns(roleBoundaryArns);
         sessions.put(sessionAccessKeyId, session);
+    }
+
+    /**
+     * The boundary a role created by {@code callerAccessKeyId} has to carry, or empty for a caller
+     * holding no delegated session or one whose request restricted nothing. A request may name
+     * several and a role carries one, so the first is the one applied, which this emulator's own
+     * reading documents. Only a boundary still registered is applied: a request stored before the
+     * registration changed names an ARN with no document, and a role bounded by a document nobody
+     * can read would be a role nothing can use.
+     */
+    public Optional<String> delegatedRoleBoundaryArn(String callerAccessKeyId) {
+        if (callerAccessKeyId == null) {
+            return Optional.empty();
+        }
+        // The session was minted in the partner's namespace and the request it bounds runs in the
+        // customer's, so this is one of the lookups that has to span accounts, as
+        // findSessionAnyAccount describes: an account-scoped get would miss it.
+        return findSessionAnyAccount(callerAccessKeyId)
+                .map(SessionCredential::getDelegatedRoleBoundaryArns)
+                .flatMap(arns -> arns.stream().filter(partnerPermissionBoundaries::containsKey).findFirst());
     }
 
     /** Stores a temporary session in an explicit account namespace. */

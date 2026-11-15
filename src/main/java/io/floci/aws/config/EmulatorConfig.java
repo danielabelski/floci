@@ -1683,6 +1683,16 @@ public interface EmulatorConfig {
          * is the AWS default.
          */
         Optional<String> accountAlias();
+
+        /**
+         * A file holding the permissions boundaries AWS registers for a delegation partner out of
+         * band, as a JSON object of boundary ARN to policy document. AWS registers those by email
+         * with no API at all, so a request naming one names a document this emulator can only be
+         * handed. Unset, which is the default, means none is registered: a request still carries
+         * its {@code RolePermissionRestrictionArns} and the role it creates takes no boundary,
+         * which is the account that never onboarded.
+         */
+        Optional<String> partnerPermissionBoundariesPath();
     }
 
     interface MskServiceConfig {
